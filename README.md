@@ -1,224 +1,666 @@
 # git-clone-https-github.com-binance-grid-trader.git-cd-binance-grid-trader
-import json
-import hmac
-import hashlib
-import requests
-import signal
-import sys
-import os
+import threading
+from queue import Queue
+from binance import Client, BinanceAPIException
+from binance.enums import *
 import time
-from datetime import datetime
+import os
+import pickle
+import logging
+from decimal import Decimal, getcontext
 
-class BinanceGridTrader:
-    def __init__(self, config_file='config.json'):
-        # Инициализация флагов и обработчиков сигналов
-        self.shutdown_flag = False
-        signal.signal(signal.SIGINT, self.handle_signal)
-        signal.signal(signal.SIGTERM, self.handle_signal)
+class SpotGridTradingBot:
+    def __init__(self, api_key, api_secret, symbol='BTCUSDT',
+                 take_profit=0.005, grid_step=0.0025,
+                 max_levels=5, trend_multiplier=1.2,
+                 counter_trend_multiplier=1.5,
+                 state_file='bot_state.pkl'):
         
-        # Загрузка конфигурации
-        self.load_config(config_file)
+        # Установка точности для Decimal
+        getcontext().prec = 8
         
-        # Настройки API
-        self.base_url = 'https://api.binance.com'
-        self.headers = {'X-MBX-APIKEY': self.api_key}
+        # Инициализация клиента Binance
+        self.client = Client(api_key, api_secret)
+        self.symbol = symbol
+        self.is_active = True
+        self.state_file = state_file
         
-        # Параметры торговли
-        self.symbol = 'BTCUSDT'
-        self.timeframe = '1h'
-        self.base_amount = 0.001
-        self.trend_multiplier = 1.5
-        self.counter_multiplier = 3
-        self.max_orders = 10
-        self.profit_target = 1.005
-        self.drawdown_limit = 0.01
-        self.order_spread = 0.005
+        # Параметры стратегии
+        self.take_profit = Decimal(str(take_profit))
+        self.grid_step = Decimal(str(grid_step))
+        self.max_levels = max_levels
+        self.trend_multiplier = Decimal(str(trend_multiplier))
+        self.counter_trend_multiplier = Decimal(str(counter_trend_multiplier))
         
-        # Получение информации о символе и tick size
-        self.symbol_info = self.get_symbol_info()
-        if not self.symbol_info:
-            raise Exception("Failed to get symbol info")
-        self.tick_size = float(self.symbol_info['filters'][0]['tickSize'])
+        # Очередь ордеров и поток обработки
+        self.order_queue = Queue()
+        self.order_executor = threading.Thread(target=self._process_orders)
+        self.order_executor.daemon = True
         
-        # Состояние системы
-        self.active_orders = []
-        self.trade_history = []
-        self.last_candle_time = None
-        self.current_trend = None
-        self.initial_balance = self.get_account_balance()
-        self.current_balance = self.initial_balance
-        self.retry_count = 3
-        self.retry_delay = 5
+        # Инициализация параметров рынка
+        self._load_market_info()
+        
+        # Восстановление состояния
+        self._init_grid()
+        self._restore_state()
+        
+        # Логирование
+        self._setup_logging()
+        
+        # Для защиты от дублирования и управления ордерами
+        self.active_orders = {}  # {order_id: {'side': side, 'level': level, 'price': price, 'quantity': qty}}
+        self.order_lock = threading.Lock()
+        self.last_order_check = 0
+        self.emergency_flag = False
+        self.hedge_attempts = {}  # Для отслеживания попыток хеджирования
 
-    def handle_signal(self, signum, frame):
-        """Обработчик сигналов для graceful shutdown"""
-        print(f"\nReceived signal {signum}, initiating graceful shutdown...")
-        self.shutdown_flag = True
+    def _setup_logging(self):
+        """Настройка расширенного логирования"""
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler('grid_trading.log'),
+                logging.StreamHandler()
+            ]
+        )
+        # Дополнительный логгер для экстренных ситуаций
+        self.emergency_logger = logging.getLogger('emergency')
+        emergency_handler = logging.FileHandler('emergency.log')
+        emergency_handler.setFormatter(logging.Formatter('%(asctime)s - EMERGENCY - %(message)s'))
+        self.emergency_logger.addHandler(emergency_handler)
+        self.emergency_logger.setLevel(logging.WARNING)
 
-    def load_config(self, config_file):
-        """Загрузка конфигурации"""
+    def _load_market_info(self):
+        """Загрузка параметров торговой пары с обработкой ошибок"""
         try:
-            if os.path.exists(config_file):
-                with open(config_file) as f:
-                    config = json.load(f)
-                self.api_key = config['api_key']
-                self.api_secret = config['api_secret']
-            else:
-                self.api_key = os.environ['BINANCE_API_KEY']
-                self.api_secret = os.environ['BINANCE_API_SECRET']
+            info = self.client.get_symbol_info(self.symbol)
+            self.filters = {
+                'min_qty': Decimal(info['filters'][2]['minQty']),
+                'step_size': Decimal(info['filters'][2]['stepSize']),
+                'min_notional': Decimal(info['filters'][3]['minNotional']),
+                'tick_size': Decimal(info['filters'][0]['tickSize'])
+            }
+            logging.info("Market info loaded successfully")
         except Exception as e:
-            raise Exception(f"Configuration load error: {str(e)}")
+            self.emergency_logger.critical(f"Failed to load market info: {str(e)}")
+            raise
 
-    def get_symbol_info(self):
-        """Получение информации о символе (включая tick size)"""
+    def _init_grid(self):
+        """Инициализация сетки с Decimal"""
+        self.grid_levels = {}
+        self.current_level = 0
+        self.base_asset = self.symbol[:-4]  # BTC
+        self.quote_asset = self.symbol[-4:]  # USDT
+        self.update_balances()
+
+    def _restore_state(self):
+        """Восстановление состояния после перезапуска с обработкой ошибок"""
         try:
-            response = requests.get(
-                f"{self.base_url}/api/v3/exchangeInfo",
-                params={'symbol': self.symbol}
-            )
-            response.raise_for_status()
-            data = response.json()
-            for symbol_data in data['symbols']:
-                if symbol_data['symbol'] == self.symbol:
-                    return symbol_data
-            return None
+            if os.path.exists(self.state_file):
+                with open(self.state_file, 'rb') as f:
+                    state = pickle.load(f)
+                    self.grid_levels = {int(k): v for k, v in state.get('grid_levels', {}).items()}
+                    self.current_level = state.get('current_level', 0)
+                    
+                    # Конвертация в Decimal при восстановлении
+                    for level, data in self.grid_levels.items():
+                        if 'level_price' in data:
+                            self.grid_levels[level]['level_price'] = Decimal(str(data['level_price']))
+                        if 'buy_price' in data:  # Для обратной совместимости
+                            self.grid_levels[level]['level_price'] = Decimal(str(data['buy_price']))
+                            del self.grid_levels[level]['buy_price']
+                        if 'sell_price' in data:  # Для обратной совместимости
+                            del self.grid_levels[level]['sell_price']
+                    
+                    logging.info("State restored successfully")
         except Exception as e:
-            print(f"Symbol info error: {str(e)}")
-            return None
+            self.emergency_logger.error(f"Error restoring state: {str(e)}")
+            # В случае ошибки - начинаем с чистого состояния
+            self._init_grid()
 
-    def validate_price(self, price):
-        """Корректировка цены под tick size"""
+    def _save_state(self):
+        """Атомарное сохранение текущего состояния"""
         try:
-            return round(price / self.tick_size) * self.tick_size
-        except Exception as e:
-            print(f"Price validation error: {str(e)}")
-            return None
-
-    def make_api_request(self, endpoint, params=None, method='GET', signed=False):
-        """Улучшенный API-запрос с обработкой ошибок"""
-        url = f"{self.base_url}{endpoint}"
-        
-        for attempt in range(self.retry_count):
-            try:
-                if signed:
-                    params = params or {}
-                    params['timestamp'] = int(time.time() * 1000)
-                    query_string = '&'.join([f"{k}={v}" for k, v in params.items()])
-                    signature = hmac.new(
-                        self.api_secret.encode('utf-8'),
-                        query_string.encode('utf-8'),
-                        hashlib.sha256
-                    ).hexdigest()
-                    params['signature'] = signature
-                
-                if method == 'GET':
-                    response = requests.get(url, headers=self.headers, params=params, timeout=10)
-                else:
-                    response = requests.post(url, headers=self.headers, data=params, timeout=10)
-                
-                response.raise_for_status()
-                return response.json()
-                
-            except requests.exceptions.ConnectionError:
-                print(f"Connection error (attempt {attempt + 1}), retrying...")
-                if attempt == self.retry_count - 1:
-                    raise
-                time.sleep(self.retry_delay * (attempt + 1))
-                
-            except requests.exceptions.RequestException as e:
-                print(f"API request failed (attempt {attempt + 1}): {str(e)}")
-                if attempt == self.retry_count - 1:
-                    raise
-                time.sleep(self.retry_delay)
-        return None
-
-    def place_order(self, side, price, amount):
-        """Размещение ордера с проверкой tick size"""
-        validated_price = self.validate_price(price)
-        if validated_price is None:
-            print(f"Invalid price {price} after tick size validation")
-            return None
+            # Конвертация Decimal в float для сериализации
+            state_to_save = {
+                'grid_levels': {
+                    level: {
+                        k: float(v) if isinstance(v, Decimal) else v 
+                        for k, v in data.items()
+                    } 
+                    for level, data in self.grid_levels.items()
+                },
+                'current_level': self.current_level
+            }
             
-        try:
-            order = self.make_api_request(
-                '/api/v3/order',
-                method='POST',
-                signed=True,
-                params={
-                    'symbol': self.symbol,
-                    'side': side,
-                    'type': 'LIMIT',
-                    'timeInForce': 'GTC',
-                    'quantity': round(amount, 6),
-                    'price': round(validated_price, 2),
-                    'recvWindow': 5000
-                }
-            )
-            return order
+            # Атомарная запись через временный файл
+            temp_file = self.state_file + '.tmp'
+            with open(temp_file, 'wb') as f:
+                pickle.dump(state_to_save, f)
+            
+            if os.path.exists(self.state_file):
+                os.remove(self.state_file)
+            os.rename(temp_file, self.state_file)
+            
         except Exception as e:
-            print(f"Order placement error: {str(e)}")
-            return None
+            self.emergency_logger.error(f"Error saving state: {str(e)}")
 
-    def cancel_all_orders(self):
-        """Отмена всех активных ордеров"""
+    def update_balances(self):
+        """Обновление балансов с Decimal"""
         try:
-            orders = self.make_api_request(
-                '/api/v3/openOrders',
-                signed=True,
-                params={'symbol': self.symbol}
-            )
-            for order in orders:
-                self.cancel_order(order['orderId'])
-            self.active_orders = []
-            return True
+            base_balance = self.client.get_asset_balance(self.base_asset)
+            quote_balance = self.client.get_asset_balance(self.quote_asset)
+            
+            self.balances = {
+                self.base_asset: Decimal(base_balance['free']),
+                self.quote_asset: Decimal(quote_balance['free'])
+            }
         except Exception as e:
-            print(f"Cancel all orders error: {str(e)}")
+            self.emergency_logger.error(f"Error updating balances: {str(e)}")
+            # В случае ошибки используем последние известные значения
+            if not hasattr(self, 'balances'):
+                self.balances = {
+                    self.base_asset: Decimal('0'),
+                    self.quote_asset: Decimal('0')
+                }
+
+    def _process_orders(self):
+        """Обработка ордеров в фоновом режиме с трехуровневым хеджированием"""
+        while self.is_active:
+            try:
+                side, volume, level = self.order_queue.get(timeout=1)
+                order_key = f"{side}_{level}"
+                
+                try:
+                    target_price = self._calculate_level_price(level)
+                    
+                    # Проверка минимального шага цены
+                    if not self._validate_price_step(target_price):
+                        logging.warning(f"Price {target_price} doesn't match tick size, skipping")
+                        continue
+                    
+                    with self.order_lock:
+                        # Проверка на существующий ордер в этом ценовом диапазоне
+                        if self._is_order_active_near(target_price):
+                            logging.info(f"Order already exists near {target_price}, skipping")
+                            continue
+                            
+                        # Инициализация счетчика попыток для этого ордера
+                        if order_key not in self.hedge_attempts:
+                            self.hedge_attempts[order_key] = 0
+                        
+                        # Увеличиваем счетчик попыток
+                        self.hedge_attempts[order_key] += 1
+                        
+                        # Трехуровневая система хеджирования
+                        if self.hedge_attempts[order_key] == 1:
+                            # Первая попытка: Рыночный ордер
+                            logging.info(f"Attempting MARKET {side} for level {level}")
+                            self._execute_market_order(side, volume, level, target_price)
+                            
+                        elif self.hedge_attempts[order_key] == 2:
+                            # Вторая попытка: Лимитный ордер по расчетной цене
+                            logging.info(f"Attempting LIMIT {side} for level {level}")
+                            self._execute_limit_order(side, volume, level, target_price)
+                            
+                        elif self.hedge_attempts[order_key] >= 3:
+                            # Третья попытка: Экстренное логирование и обработка
+                            self.emergency_logger.warning(
+                                f"Failed to execute {side} order for level {level} after 2 attempts. "
+                                f"Volume: {volume}, Target price: {target_price}"
+                            )
+                            self._emergency_handling(side, volume, level, target_price)
+                            continue
+                            
+                    time.sleep(0.5)
+                except BinanceAPIException as e:
+                    logging.error(f"Order failed: {e.status_code} {e.message}")
+                    with self.order_lock:
+                        self._cleanup_canceled_orders()
+                finally:
+                    self.order_queue.task_done()
+                    self.update_balances()
+                    self._save_state()
+            except:
+                continue
+
+    def _execute_market_order(self, side, volume, level, target_price):
+        """Попытка исполнения рыночного ордера"""
+        try:
+            if side == 'BUY':
+                quote_needed = volume * target_price * Decimal('1.001')
+                if self.balances[self.quote_asset] >= quote_needed:
+                    order = self.client.create_order(
+                        symbol=self.symbol,
+                        side=SIDE_BUY,
+                        type=ORDER_TYPE_MARKET,
+                        quantity=self._round_quantity(volume)
+                    
+                    logging.info(f"MARKET BUY executed: {volume} @ market price")
+                    self._register_order_execution(order, side, level, target_price, volume)
+                    return True
+                    
+            elif side == 'SELL':
+                if self.balances[self.base_asset] >= volume * Decimal('1.001'):
+                    order = self.client.create_order(
+                        symbol=self.symbol,
+                        side=SIDE_SELL,
+                        type=ORDER_TYPE_MARKET,
+                        quantity=self._round_quantity(volume))
+                    
+                    logging.info(f"MARKET SELL executed: {volume} @ market price")
+                    self._register_order_execution(order, side, level, target_price, volume)
+                    return True
+                    
+        except BinanceAPIException as e:
+            logging.error(f"Market order failed: {e.status_code} {e.message}")
+            # Добавляем ордер обратно в очередь для следующей попытки
+            self.order_queue.put((side, volume, level))
+            return False
+            
+        return False
+
+    def _execute_limit_order(self, side, volume, level, target_price):
+        """Попытка исполнения лимитного ордера"""
+        try:
+            if side == 'BUY':
+                quote_needed = volume * target_price * Decimal('1.001')
+                if self.balances[self.quote_asset] >= quote_needed:
+                    order = self.client.create_order(
+                        symbol=self.symbol,
+                        side=SIDE_BUY,
+                        type=ORDER_TYPE_LIMIT,
+                        timeInForce=TIME_IN_FORCE_GTC,
+                        quantity=self._round_quantity(volume),
+                        price=self._round_price(target_price))
+                    
+                    logging.info(f"LIMIT BUY order placed: {volume} @ {target_price}")
+                    self._register_active_order(order, side, level, target_price, volume)
+                    return True
+                    
+            elif side == 'SELL':
+                if self.balances[self.base_asset] >= volume * Decimal('1.001'):
+                    order = self.client.create_order(
+                        symbol=self.symbol,
+                        side=SIDE_SELL,
+                        type=ORDER_TYPE_LIMIT,
+                        timeInForce=TIME_IN_FORCE_GTC,
+                        quantity=self._round_quantity(volume),
+                        price=self._round_price(target_price))
+                    
+                    logging.info(f"LIMIT SELL order placed: {volume} @ {target_price}")
+                    self._register_active_order(order, side, level, target_price, volume)
+                    return True
+                    
+        except BinanceAPIException as e:
+            logging.error(f"Limit order failed: {e.status_code} {e.message}")
+            # Добавляем ордер обратно в очередь для следующей попытки
+            self.order_queue.put((side, volume, level))
+            return False
+            
+        return False
+
+    def _emergency_handling(self, side, volume, level, target_price):
+        """Экстренная обработка неудачных ордеров"""
+        self.emergency_flag = True
+        self.emergency_logger.critical(
+            f"EMERGENCY: Failed to execute {side} order after multiple attempts. "
+            f"Level: {level}, Volume: {volume}, Price: {target_price}"
+        )
+        
+        # Отменяем все связанные ордера
+        self._cancel_related_orders(level, side)
+        
+        # Обновляем балансы
+        self.update_balances()
+        
+        # Логируем текущее состояние
+        self._log_full_state()
+        
+        # Сбрасываем флаг после обработки
+        self.emergency_flag = False
+        del self.hedge_attempts[f"{side}_{level}"]
+
+    def _cancel_related_orders(self, level, side):
+        """Отмена всех связанных ордеров для уровня"""
+        with self.order_lock:
+            orders_to_cancel = []
+            for order_id, order_info in self.active_orders.items():
+                if order_info['level'] == level and order_info['side'] == side:
+                    orders_to_cancel.append(order_id)
+            
+            for order_id in orders_to_cancel:
+                try:
+                    self.client.cancel_order(
+                        symbol=self.symbol,
+                        orderId=order_id
+                    )
+                    logging.info(f"Cancelled related order {order_id}")
+                    del self.active_orders[order_id]
+                except Exception as e:
+                    logging.error(f"Error cancelling order {order_id}: {str(e)}")
+
+    def _log_full_state(self):
+        """Логирование полного состояния системы"""
+        state = {
+            'balances': {k: str(v) for k, v in self.balances.items()},
+            'grid_levels': self.grid_levels,
+            'current_level': self.current_level,
+            'active_orders': self.active_orders,
+            'emergency_flag': self.emergency_flag
+        }
+        self.emergency_logger.info(f"Full system state: {state}")
+
+    def _register_active_order(self, order, side, level, price, quantity):
+        """Регистрация активного ордера"""
+        with self.order_lock:
+            self.active_orders[order['orderId']] = {
+                'side': side,
+                'level': level,
+                'price': Decimal(str(price)),
+                'quantity': Decimal(str(quantity)),
+                'timestamp': time.time()
+            }
+
+    def _register_order_execution(self, order, side, level, price, quantity):
+        """Регистрация исполненного ордера"""
+        # Для рыночных ордеров получаем детали исполнения
+        try:
+            order_details = self.client.get_order(
+                symbol=self.symbol,
+                orderId=order['orderId']
+            )
+            
+            executed_qty = Decimal(str(order_details['executedQty']))
+            avg_price = Decimal(str(order_details['price']))
+            
+            logging.info(f"Order {order['orderId']} executed: {executed_qty} @ {avg_price}")
+            
+            # Обновляем уровень сетки
+            if level in self.grid_levels:
+                self.grid_levels[level][f"{side.lower()}_executed"] = True
+                self.grid_levels[level][f"{side.lower()}_executed_qty"] = executed_qty
+                self.grid_levels[level][f"{side.lower()}_avg_price"] = avg_price
+            
+            # Обновляем балансы
+            self.update_balances()
+            
+        except Exception as e:
+            logging.error(f"Error registering order execution: {str(e)}")
+
+    def _validate_price_step(self, price):
+        """Проверка соответствия цены минимальному шагу с Decimal"""
+        tick_size = self.filters['tick_size']
+        price_mod = (price / tick_size) - (price / tick_size).quantize(Decimal('1.'))
+        return abs(price_mod) < Decimal('1e-8')
+
+    def _round_price(self, price):
+        """Округление цены согласно шагу цены с Decimal"""
+        tick_size = self.filters['tick_size']
+        return (price / tick_size).quantize(Decimal('1.')) * tick_size
+
+    def _round_quantity(self, quantity):
+        """Округление количества согласно шагу объема с Decimal"""
+        step_size = self.filters['step_size']
+        return (quantity / step_size).quantize(Decimal('1.')) * step_size
+
+    def get_current_price(self):
+        """Получение текущей цены с Decimal"""
+        try:
+            ticker = self.client.get_symbol_ticker(symbol=self.symbol)
+            return Decimal(ticker['price'])
+        except Exception as e:
+            self.emergency_logger.error(f"Error getting price: {str(e)}")
+            return Decimal('0')
+
+    def _calculate_level_price(self, level):
+        """Расчет единой цены для уровня (и для покупки, и для продажи)"""
+        base_price = self.get_current_price()
+        # Используем абсолютное значение grid_step
+        price = base_price * (Decimal('1') - abs(self.grid_step)) ** level
+        return self._round_price(price)
+
+    def check_grid_activation(self):
+        """Проверка активации уровней сетки с одинаковыми ценами"""
+        current_price = self.get_current_price()
+        if current_price <= Decimal('0'):
+            return
+            
+        for level in range(1, self.max_levels+1):
+            level_price = self._calculate_level_price(level)
+            
+            # Для buy-ордера: если цена <= уровня
+            if current_price <= level_price and not self._is_order_active_near(level_price):
+                self._activate_level(level, 'BUY')
+            
+            # Для sell-ордера: если цена >= уровня
+            if current_price >= level_price and not self._is_order_active_near(level_price):
+                self._activate_level(level, 'SELL')
+
+    def _is_order_active_near(self, price):
+        """Проверка наличия активного ордера вблизи цены"""
+        with self.order_lock:
+            tick_size = self.filters['tick_size']
+            return any(
+                abs(Decimal(str(order_info['price'])) - price < tick_size
+                for order_info in self.active_orders.values()
+            )
+
+    def _activate_level(self, level, side):
+        """Активация уровня сетки с проверкой баланса"""
+        if self.current_level >= self.max_levels:
+            return
+
+        volume = self._calculate_volume(level, side)
+        level_price = self._calculate_level_price(level)  # Используем общую цену
+        
+        if self._check_balance(side, volume):
+            self.order_queue.put((side, volume, level))
+            # Сохраняем данные об уровне
+            if level not in self.grid_levels:
+                self.grid_levels[level] = {
+                    'level_price': level_price  # Общая цена для уровня
+                }
+            # Сохраняем данные конкретно для этого ордера
+            self.grid_levels[level].update({
+                f"{side.lower()}_active": True,
+                f"{side.lower()}_volume": volume
+            })
+            self.current_level += 1
+            self._save_state()
+
+    def _calculate_volume(self, level, side):
+        """Расчет объема для уровня с Decimal"""
+        base_volume = max(
+            self.filters['min_notional'] / self.get_current_price(),
+            self.filters['min_qty']
+        )
+        multiplier = self.trend_multiplier if side == self._get_trend_direction() else self.counter_trend_multiplier
+        return self._round_quantity(base_volume * (multiplier ** level))
+
+    def _check_balance(self, side, volume):
+        """Проверка баланса с Decimal"""
+        try:
+            if side == 'BUY':
+                required = volume * self.get_current_price() * Decimal('1.001')
+                return self.balances[self.quote_asset] >= required
+            else:
+                return self.balances[self.base_asset] >= volume * Decimal('1.001')
+        except Exception as e:
+            self.emergency_logger.error(f"Balance check error: {str(e)}")
             return False
 
-    def add_recovery_orders(self, drawdown):
-        """Добавление ордеров с проверкой лимита"""
-        if len(self.active_orders) >= self.max_orders:
-            print(f"Max orders limit reached ({self.max_orders})")
-            return
+    def _get_trend_direction(self):
+        """Определение направления тренда"""
+        # Здесь можно реализовать более сложную логику
+        return 'BUY' if self.grid_step > Decimal('0') else 'SELL'
+
+    def _cleanup_canceled_orders(self):
+        """Очистка отмененных ордеров с улучшенным логированием"""
+        try:
+            canceled_orders = []
+            for order_id, order_info in list(self.active_orders.items()):
+                try:
+                    order_status = self.client.get_order(
+                        symbol=self.symbol,
+                        orderId=order_id
+                    )
+                    if order_status['status'] in ['CANCELED', 'REJECTED', 'EXPIRED']:
+                        canceled_orders.append(order_id)
+                        logging.info(f"Order {order_id} was {order_status['status']}. Reason: {order_status.get('text', 'no reason provided')}")
+                except BinanceAPIException as e:
+                    if e.code == -2013:  # Order does not exist
+                        canceled_orders.append(order_id)
+                        logging.info(f"Order {order_id} no longer exists")
+                    else:
+                        logging.error(f"Error checking order {order_id}: {e.status_code} {e.message}")
             
+            with self.order_lock:
+                for order_id in canceled_orders:
+                    if order_id in self.active_orders:
+                        del self.active_orders[order_id]
+        except Exception as e:
+            self.emergency_logger.error(f"Error cleaning canceled orders: {str(e)}")
+
+    def _sync_active_orders(self):
+        """Синхронизация активных ордеров с биржей"""
+        try:
+            with self.order_lock:
+                self.active_orders.clear()
+                open_orders = self.client.get_open_orders(symbol=self.symbol)
+                for order in open_orders:
+                    self.active_orders[order['orderId']] = {
+                        'side': order['side'],
+                        'price': Decimal(order['price']),
+                        'quantity': Decimal(order['origQty']),
+                        'level': self._find_level_for_order(Decimal(order['price']), order['side']),
+                        'timestamp': time.time()
+                    }
+                logging.info(f"Synced {len(open_orders)} active orders")
+        except Exception as e:
+            self.emergency_logger.error(f"Error syncing orders: {str(e)}")
+
+    def _find_level_for_order(self, price, side):
+        """Поиск уровня для ордера"""
+        for level, data in self.grid_levels.items():
+            level_price = data.get('level_price', Decimal('0'))
+            if abs(level_price - price) < self.filters['tick_size']:
+                return level
+        return 0
+
+    def _cleanup_filled_orders(self):
+        """Очистка исполненных ордеров с улучшенной обработкой"""
+        try:
+            current_time = time.time()
+            if current_time - self.last_order_check < 60:  # Проверяем не чаще чем раз в минуту
+                return
+                
+            self.last_order_check = current_time
+            
+            with self.order_lock:
+                filled_orders = []
+                for order_id, order_info in list(self.active_orders.items()):
+                    try:
+                        order_status = self.client.get_order(
+                            symbol=self.symbol,
+                            orderId=order_id
+                        )
+                        if order_status['status'] == 'FILLED':
+                            filled_orders.append(order_id)
+                            logging.info(f"Order {order_id} was filled. Executed: {order_status['executedQty']} @ ~{order_status['price']}")
+                    except BinanceAPIException as e:
+                        if e.code == -2013:  # Order does not exist
+                            filled_orders.append(order_id)
+                            logging.info(f"Order {order_id} no longer exists (assumed filled)")
+                        else:
+                            logging.error(f"Error checking order {order_id}: {e.status_code} {e.message}")
+                
+                for order_id in filled_orders:
+                    if order_id in self.active_orders:
+                        # Обновляем информацию об исполнении в grid_levels
+                        order_info = self.active_orders[order_id]
+                        level = order_info['level']
+                        side = order_info['side']
+                        
+                        if level in self.grid_levels:
+                            self.grid_levels[level][f"{side.lower()}_executed"] = True
+                            self.grid_levels[level][f"{side.lower()}_executed_qty"] = order_info['quantity']
+                            self.grid_levels[level][f"{side.lower()}_executed_price"] = order_info['price']
+                        
+                        del self.active_orders[order_id]
+        except Exception as e:
+            self.emergency_logger.error(f"Error cleaning filled orders: {str(e)}")
+
+    def _check_profit(self):
+        """Проверка достижения тейк-профита"""
         current_price = self.get_current_price()
-        if current_price is None:
-            return
-
-        multiplier = min(2, 1 + (drawdown / self.drawdown_limit))
-        
-        buy_price = self.validate_price(current_price * (1 - self.order_spread * multiplier))
-        buy_amount = round(self.base_amount * (self.counter_multiplier ** multiplier), 6)
-        
-        sell_price = self.validate_price(current_price * (1 + self.order_spread * multiplier))
-        sell_amount = round(self.base_amount * (self.trend_multiplier ** multiplier), 6)
-        
-        if buy_price is None or sell_price is None:
+        if current_price <= Decimal('0'):
             return
             
-        buy_order = self.place_order('BUY', buy_price, buy_amount)
-        sell_order = self.place_order('SELL', sell_price, sell_amount)
-        
-        if buy_order and sell_order:
-            self.active_orders.extend([buy_order, sell_order])
-            self.record_trade('recovery', buy_order, sell_order)
+        for level, data in self.grid_levels.items():
+            level_price = data.get('level_price', Decimal('0'))
+            
+            # Для buy-ордеров: закрываем, если цена выросла на take_profit
+            if data.get('buy_active', False) and current_price >= level_price * (Decimal('1') + self.take_profit):
+                self._close_level(level, 'BUY')
+            
+            # Для sell-ордеров: закрываем, если цена упала на take_profit
+            if data.get('sell_active', False) and current_price <= level_price * (Decimal('1') - self.take_profit):
+                self._close_level(level, 'SELL')
 
-    def cleanup(self):
-        """Очистка перед завершением работы"""
-        print("\nPerforming cleanup...")
-        self.cancel_all_orders()
-        print("Cleanup completed. Exiting.")
+    def _close_level(self, level, side):
+        """Закрытие уровня с проверкой баланса"""
+        volume = self.grid_levels[level].get(f"{side.lower()}_volume", Decimal('0'))
+        if volume > Decimal('0'):
+            self.order_queue.put(('SELL' if side == 'BUY' else 'BUY', volume, level))
+            self.grid_levels[level][f"{side.lower()}_active"] = False
+            self.current_level -= 1
+            logging.info(f"Closed {side} level {level}")
+            self._save_state()
 
-    def run(self):
-        """Основной цикл с обработкой graceful shutdown"""
-        print(f"Starting Binance Grid Trader for {self.symbol}")
-        print(f"Initial balance: {self.initial_balance:.2f} USDT")
+    def start_trading(self):
+        """Запуск торговли с обработкой исключений"""
+        logging.info("Starting grid trading bot")
+        self.order_executor.start()
         
         try:
-            while not self.shutdown_flag:
+            # Синхронизация активных ордеров
+            self._sync_active_orders()
+            
+            while self.is_active:
                 try:
-                    if self.check_new_candle():
-                        # ... остальная торговая логика ...
-                        pass
-                        
-                    time.sleep(60)
+                    self.check_grid_activation()
+                    self._check_profit()
+                    self._cleanup_filled_orders()
+                    self._cleanup_canceled_orders()
+                    time.sleep(5)
+                except Exception as e:
+                    logging.error(f"Error in main loop: {str(e)}")
+                    time.sleep(10)  # Подождать перед повторной попыткой
+                    
+        except KeyboardInterrupt:
+            logging.info("Received keyboard interrupt, stopping...")
+            self.stop_trading()
+        except Exception as e:
+            self.emergency_logger.critical(f"Critical error in main loop: {str(e)}")
+            self.stop_trading()
+
+    def stop_trading(self):
+        """Остановка торговли с улучшенной обработкой"""
+        self.is_active = False
+        logging.info("Stopping grid trading bot")
+        
+        # Отмена всех активных ордеров
+        try:
+            with self.order_lock:
+                for order_id in list(self.active_orders.keys()):
+                    try:
+                        self.client.cancel_order(
+                            symbol=self.symbol,
+                            orderId=order_id
+                        )
+                        logging.info(f"Cancelled order {order_id}")
+                    except Exception as e:
+                        logging.error(f"Error cancelling order {order_id}: {str(e)}")
+                self.active_orders.clear()
